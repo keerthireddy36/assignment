@@ -1,0 +1,123 @@
+# LivePortrait Optimization Script
+# Full implementation with all optimizations
+
+# Part 1: Setup and Installation
+!git clone https://github.com/KwaiVGI/LivePortrait.git
+%cd LivePortrait
+
+# Install requirements with versions that support optimizations
+!pip install -r requirements.txt
+!pip install torch==2.0.0+cu118 torchvision==0.15.1+cu118 --extra-index-url https://download.pytorch.org/whl/cu118
+!pip install onnxruntime-gpu==1.15.1
+
+# Part 2: Modified Inference Code
+%%writefile optimized_inference.py
+import torch
+import time
+import numpy as np
+from PIL import Image
+import torchvision.transforms as transforms
+from models.model import LivePortraitModel
+from utils.video_reader import VideoReader
+from utils.visualizer import save_video
+
+class OptimizedLivePortrait:
+    def __init__(self):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = self._load_optimized_model()
+        self.transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+        ])
+
+    def _load_optimized_model(self):
+        """Load model with all optimizations applied"""
+        model = LivePortraitModel().eval()
+        model = model.to(self.device)
+
+        # Apply all optimizations
+        model = model.half()  # FP16 precision
+
+        if torch.__version__ >= '2.0.0':
+            model = torch.compile(model, mode='max-autotune')
+
+        return model
+
+    def _preprocess_image(self, image_path):
+        """Optimized image preprocessing"""
+        image = Image.open(image_path).convert('RGB')
+        image = self.transform(image).unsqueeze(0)
+        return image.half().to(self.device)
+
+    def _process_video_batch(self, video_path, batch_size=8):
+        """Batch process video frames for better GPU utilization"""
+        reader = VideoReader(video_path)
+        frames = []
+        processed_frames = []
+
+        for frame in reader:
+            frame_tensor = self.transform(frame).unsqueeze(0)
+            frames.append(frame_tensor)
+
+            if len(frames) >= batch_size:
+                batch = torch.cat(frames).half().to(self.device)
+                with torch.no_grad():
+                    result = self.model.process_batch(batch)
+                processed_frames.extend(result.cpu().unbind())
+                frames = []
+
+        # Process remaining frames
+        if frames:
+            batch = torch.cat(frames).half().to(self.device)
+            with torch.no_grad():
+                result = self.model.process_batch(batch)
+            processed_frames.extend(result.cpu().unbind())
+
+        return processed_frames
+
+    def run(self, source_image, driver_video, output_path='output.mp4'):
+        """Optimized inference pipeline"""
+        start_time = time.time()
+
+        # Process source image
+        source = self._preprocess_image(source_image)
+
+        # Process driver video in batches
+        driven_frames = self._process_video_batch(driver_video)
+
+        # Generate output frames
+        output_frames = []
+        with torch.no_grad():
+            for driven in driven_frames:
+                driven = driven.to(self.device).unsqueeze(0).half()
+                output = self.model(source, driven)
+                output_frames.append(output.squeeze().cpu().numpy())
+
+        # Save result
+        save_video(output_frames, output_path, fps=30)
+
+        return time.time() - start_time
+
+# Part 3: Benchmarking
+if __name__ == "__main__":
+    # Initialize
+    portrait = OptimizedLivePortrait()
+
+    # Original inference (unoptimized)
+    print("Running original inference...")
+    from inference import inference_image
+    original_time = inference_image(source_image="data/source.jpg",
+                                  driver_video="data/driver.mp4",
+                                  output_path="original_output.mp4")
+
+    # Optimized inference
+    print("Running optimized inference...")
+    optimized_time = portrait.run(source_image="data/source.jpg",
+                                driver_video="data/driver.mp4",
+                                output_path="optimized_output.mp4")
+
+    # Results
+    print(f"\nBenchmark Results:")
+    print(f"Original inference time: {original_time:.2f}s")
+    print(f"Optimized inference time: {optimized_time:.2f}s")
+    print(f"Speedup factor: {original_time/optimized_time:.2f}x")
